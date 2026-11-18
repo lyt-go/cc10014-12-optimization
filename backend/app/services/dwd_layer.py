@@ -1,10 +1,16 @@
 """明细层管理业务规则：消费ODS层数据，应用清洗+去重，生成DWD明细表，版本化管理。"""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from app.store import store
+from app.services.dwd_refresh_status import (
+    EVENT_SCHEDULED,
+    STATUS_FAILED,
+    STATUS_SUCCESS,
+    DwdRefreshStatusService,
+)
 
 MODULE = "dwd_layer"
 LIST_FIELDS = ["表编号", "父层来源", "表名称", "粒度说明", "分区字段", "关联键列", "刷新水位", "创建批次"]
@@ -69,7 +75,12 @@ class DwdLayerService:
         return entry, f"明细表已{action}"
 
     def build_dwd_from_ods(self, entry_id: int) -> dict[str, Any]:
-        """从关联的ODS表读取数据，应用清洗+去重，写入DWD模拟表。"""
+        """从关联的ODS表读取数据，应用清洗+去重，写入DWD模拟表。
+
+        刷新事件与明细刷新状态视图在同一批次事务内提交：先把表数据准备好，
+        再按分区聚合定时刷新事件；状态视图字段落库失败会抛错并整体回滚，
+        表数据、刷新水位与版本都不会停留在半成品状态。
+        """
         entry = self.get_entry(entry_id)
         if not entry:
             return {"ok": False, "message": "明细表不存在"}
@@ -104,15 +115,60 @@ class DwdLayerService:
             d_entry = store.find("dedup_config", self._resolve_id("dedup_config", dedup_id))
             if d_entry:
                 ods_data = ds.apply_dedup(d_entry["id"], ods_data)
-        # 写入DWD模拟表
+
         dwd_table = entry.get("表名称", "")
+        partition_field = entry.get("分区字段", "dt") or "dt"
+        partition_diag = self._partition_diagnostics(ods_data, partition_field)
+        # 同一批次的定时刷新事件：每个分区一条，状态视图按分区去重
+        batch_id = f"DWD-{dwd_table}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        events = []
+        for seq, diag in enumerate(partition_diag, start=1):
+            failed = diag["行数"] == 0
+            events.append({
+                "批次编号": batch_id,
+                "事件类型": EVENT_SCHEDULED,
+                "表名称": dwd_table,
+                "分区值": diag["分区值"],
+                "刷新水位": diag["分区值"],
+                "状态": STATUS_FAILED if failed else STATUS_SUCCESS,
+                "完成时间": "" if failed else now_iso,
+                "数据行数": diag["行数"],
+                "失败原因": "分区清洗去重后无数据" if failed else "",
+                "事件序号": seq,
+            })
+        try:
+            DwdRefreshStatusService().record_events(events, batch_id=batch_id)
+        except ValueError as exc:
+            # 事务回滚：事件流与状态视图均未改动，表数据与水位也保持原状，可修正后重试
+            return {"ok": False, "message": f"刷新状态视图落库失败，事务已回滚：{exc}"}
+
+        # 事件与视图成功落库后再提交表数据与水位，保证两侧对应同一批次
         store.set_table_rows(dwd_table, ods_data)
-        entry["刷新水位"] = date.today().isoformat()
+        watermark = max((diag["分区值"] for diag in partition_diag), default=date.today().isoformat())
+        entry["刷新水位"] = watermark
         store.save_version(MODULE, entry_id, entry)
         # 注册血缘
         store.add_lineage(ods_table, dwd_table, ods_entry.get("字段列表", ""),
                           transform_logic="清洗+去重", batch_id=entry.get("创建批次", ""))
-        return {"ok": True, "message": f"DWD表 {dwd_table} 已生成，共{len(ods_data)}行"}
+        return {
+            "ok": True,
+            "message": f"DWD表 {dwd_table} 已生成，共{len(ods_data)}行",
+            "批次编号": batch_id,
+            "总行数": len(ods_data),
+            "分区诊断": partition_diag,
+        }
+
+    def _partition_diagnostics(self, rows: list[dict[str, Any]], partition_field: str) -> list[dict[str, Any]]:
+        """按分区字段聚合行数，替代只返回总行数的旧诊断，失败分区可直接定位。"""
+        buckets: dict[str, int] = {}
+        for row in rows:
+            partition = str(row.get(partition_field) or date.today().isoformat())
+            buckets[partition] = buckets.get(partition, 0) + 1
+        return [
+            {"分区值": partition, "行数": count, "状态": "刷新失败" if count == 0 else "刷新成功"}
+            for partition, count in sorted(buckets.items())
+        ]
 
     def _resolve_id(self, module: str, code: str) -> int:
         for row in store.rows(module):

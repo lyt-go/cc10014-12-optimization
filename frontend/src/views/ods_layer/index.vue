@@ -48,6 +48,9 @@
             >
               {{ action }}
             </button>
+            <button class="link" type="button" :data-testid="`detail-${row.id}`" @click="openDetail(row)">
+              查看详情
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -79,7 +82,7 @@
         <table class="data-table small">
           <thead><tr><th>批次编号</th><th>来源系统</th><th>文件格式</th><th>原始行数</th><th>入库时间</th></tr></thead>
           <tbody>
-            <tr v-for="b in relatedBatches" :key="b['批次编号']"><td>{{ b['批次编号'] }}</td><td>{{ b['来源系统'] }}</td><td>{{ b['文件格式'] }}</td><td>{{ b['原始行数'] }}</td><td>{{ b['入库时间'] }}</td></tr>
+            <tr v-for="b in relatedBatches" :key="String(b['批次编号'])"><td>{{ b['批次编号'] }}</td><td>{{ b['来源系统'] }}</td><td>{{ b['文件格式'] }}</td><td>{{ b['原始行数'] }}</td><td>{{ b['入库时间'] }}</td></tr>
             <tr v-if="!relatedBatches.length"><td colspan="5" class="empty-state">无关联批次</td></tr>
           </tbody>
         </table>
@@ -93,6 +96,9 @@
             <tr v-if="!tableDataPreview.length"><td :colspan="tableDataColumns.length || 1" class="empty-state">暂无数据</td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="page-actions">
+        <button class="btn" type="button" data-testid="close-detail" @click="selectedRow = null">关闭详情</button>
       </div>
     </div>
   </section>
@@ -119,6 +125,11 @@ const filterFields = columns.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const selectedRow = ref<Row | null>(null)
+const relatedBatches = ref<Row[]>([])
+const tableDataPreview = ref<Row[]>([])
+const tableDataColumns = computed(() =>
+  Array.from(new Set(tableDataPreview.value.flatMap((item) => Object.keys(item)))))
 const stats = computed(() => [
   { label: metricNames[0], value: total.value },
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
@@ -184,6 +195,29 @@ async function runAction(action: string, row: Row) {
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '贴源层管理操作失败'
+  }
+}
+
+async function openDetail(row: Row) {
+  errorMessage.value = ''
+  selectedRow.value = row
+  relatedBatches.value = []
+  tableDataPreview.value = []
+  try {
+    const [batchResp, dataResp] = await Promise.all([
+      request(`${ENDPOINT}/${row.id}/batches`),
+      request(`${ENDPOINT}/${row.id}/data`),
+    ])
+    if (batchResp.ok) {
+      const batchPayload = await batchResp.json()
+      relatedBatches.value = batchPayload.items ?? []
+    }
+    if (dataResp.ok) {
+      const dataPayload = await dataResp.json()
+      tableDataPreview.value = (dataPayload.items ?? []).slice(0, 5)
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '贴源表详情读取失败'
   }
 }
 

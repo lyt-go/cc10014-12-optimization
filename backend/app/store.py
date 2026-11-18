@@ -29,6 +29,14 @@ class Store:
         self._archive_records: list[dict[str, Any]] = []
         # 补数区间记录
         self._backfill_partitions: dict[str, list[dict[str, Any]]] = {}
+        # DWD 明细刷新事件流（同批次事件聚合写入，重复事件也原样保留可回查）
+        self._refresh_events: list[dict[str, Any]] = []
+        # DWD 明细刷新状态视图：(表名称, 分区值) -> 当前状态（视图按分区去重）
+        self._refresh_status: dict[tuple[str, str], dict[str, Any]] = {}
+        # 状态视图历史版本：旧状态被覆盖前归档，保证旧明细刷新状态视图记录都可回查
+        self._refresh_status_history: list[dict[str, Any]] = []
+        # 示例刷新事件是否已引导过（测试清库后可重新引导）
+        self._refresh_seed_done: bool = False
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -165,6 +173,84 @@ class Store:
 
     def get_backfill_partitions(self, job_id: str) -> list[dict[str, Any]]:
         return list(self._backfill_partitions.get(job_id, []))
+
+    # ---- DWD 明细刷新事件与状态视图（事务化写入） ----
+
+    def refresh_seed_done(self) -> bool:
+        return self._refresh_seed_done
+
+    def mark_refresh_seed_done(self) -> None:
+        self._refresh_seed_done = True
+
+    def list_refresh_events(self) -> list[dict[str, Any]]:
+        """返回全部刷新事件（含重复写入的原始记录），供失败重试链回查。"""
+        return [dict(event) for event in self._refresh_events]
+
+    def list_refresh_status(self) -> list[dict[str, Any]]:
+        """返回去重后的分区当前状态视图，每个分区只有一条。"""
+        return [dict(row) for row in self._refresh_status.values()]
+
+    def find_refresh_status(self, table_name: str, partition_value: str) -> dict[str, Any] | None:
+        row = self._refresh_status.get((table_name, partition_value))
+        return dict(row) if row else None
+
+    def list_refresh_status_history(self) -> list[dict[str, Any]]:
+        """返回被覆盖的旧状态视图记录，旧记录全部保留可回查。"""
+        return [dict(row) for row in self._refresh_status_history]
+
+    def commit_refresh_batch(
+        self,
+        events: list[dict[str, Any]],
+        merge_view,
+    ) -> dict[str, Any]:
+        """同一批次内原子提交刷新事件并刷新分区状态视图。
+
+        - 先在工作副本里完成全部合并与字段校验，任一条状态视图缺字段都会抛 ValueError，
+          事件流与视图都不改动，模拟数据库事务回滚；
+        - 校验通过后一次性落库：事件允许重复追加（事件流保留原始记录可回查），
+          视图按 (表名称, 分区值) 去重覆盖（同分区始终只有一条当前状态），
+          被覆盖的旧视图记录归档进历史表，保证旧明细刷新状态视图记录都可回查。
+        ``merge_view(current, event)`` 由服务层提供，封装冲突优先次序等业务规则。
+        """
+        if not events:
+            raise ValueError("刷新事件批次为空，无法提交")
+        batch_id = str(events[0].get("批次编号", ""))
+        if not batch_id:
+            raise ValueError("刷新事件缺少批次编号，事件与状态视图无法对应同一批次")
+        for event in events:
+            if str(event.get("批次编号", "")) != batch_id:
+                raise ValueError("同一事务内的刷新事件必须属于同一个批次")
+
+        working_views = {key: dict(row) for key, row in self._refresh_status.items()}
+        for event in events:
+            key = (str(event.get("表名称", "")), str(event.get("分区值", "")))
+            current = working_views.get(key)
+            merged = merge_view(dict(current) if current else None, dict(event))
+            # 状态视图字段不满足落库条件即整体回滚，保证视图行结构始终完整
+            missing = [name for name in (
+                "表名称", "分区值", "刷新水位", "批次编号", "事件类型", "当前状态",
+                "完成时间", "稽核范围", "修复批次", "失败重试链", "更新时间")
+                if name not in merged or merged[name] is None]
+            if missing:
+                raise ValueError(f"明细刷新状态视图字段缺失：{'、'.join(missing)}，事务回滚")
+            working_views[key] = merged
+
+        # 工作副本校验全部通过后才真正落库（事件追加 + 视图覆盖 + 旧视图归档）
+        next_id = max((int(e.get("id", 0)) for e in self._refresh_events), default=0)
+        for event in events:
+            next_id += 1
+            stored = dict(event)
+            stored["id"] = next_id
+            self._refresh_events.append(stored)
+        for key, merged in working_views.items():
+            old = self._refresh_status.get(key)
+            if old is not None and old != merged:
+                archived = dict(old)
+                archived["归档原因"] = f"被批次 {batch_id} 覆盖"
+                archived["归档时间"] = datetime.now().isoformat()
+                self._refresh_status_history.append(archived)
+            self._refresh_status[key] = merged
+        return {"批次编号": batch_id, "事件数": len(events), "视图分区数": len(working_views)}
 
 
 store = Store()

@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from app.store import store
+from app.services.dwd_refresh_status import DwdRefreshStatusService
 
 MODULE = "quality_check"
 LIST_FIELDS = ["规则编号", "校验表名", "校验字段", "校验表达式", "阈值下界", "阈值上界", "阻断级别", "采样比例"]
@@ -101,7 +102,41 @@ class QualityCheckService:
             "failed_rows": failed_rows[:5],  # 只保留前5条
         }
         store.save_quality_result(entry.get("规则编号", ""), result)
+        # 质量稽核跨模块同步明细刷新状态视图：失败分区落到视图，稽核范围可在面板回查
+        self._sync_refresh_status(entry, result, rows, failed_rows)
         return {"ok": True, "message": f"稽核完成：通过{total - failed}/失败{failed}", "result": result}
+
+    def _sync_refresh_status(
+        self,
+        entry: dict[str, Any],
+        result: dict[str, Any],
+        rows: list[dict[str, Any]],
+        failed_rows: list[dict[str, Any]],
+    ) -> None:
+        table = str(entry.get("校验表名", ""))
+        dwd_tables = {row.get("表名称") for row in store.rows("dwd_layer")}
+        if table not in dwd_tables:
+            return
+        scope = (
+            f"{entry.get('校验字段', '')} "
+            f"[{entry.get('阈值下界', '') or '∞'},{entry.get('阈值上界', '') or '∞'}] "
+            f"采样{entry.get('采样比例', '')}"
+        )
+        failed_partitions = sorted({
+            str(row.get("dt", "")) for row in failed_rows if row.get("dt")
+        })
+        try:
+            DwdRefreshStatusService().sync_quality_result(
+                table_name=table,
+                rule_code=str(entry.get("规则编号", "")),
+                audit_scope=scope,
+                failed_partitions=failed_partitions,
+                total=int(result.get("total", 0)),
+                failed=int(result.get("failed", 0)),
+            )
+        except ValueError:
+            # 视图同步失败不推翻稽核结论本身，结果已落 quality_results，可重新稽核同步
+            result["refresh_sync_error"] = True
 
     def _check_value(self, val: Any, expr: str, lower: str, upper: str) -> bool:
         if expr:

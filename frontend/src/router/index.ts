@@ -7,6 +7,7 @@ const CleanseRule = () => import('@/views/cleanse_rule/index.vue')
 const DedupConfig = () => import('@/views/dedup_config/index.vue')
 const OdsLayer = () => import('@/views/ods_layer/index.vue')
 const DwdLayer = () => import('@/views/dwd_layer/index.vue')
+const DwdRefreshStatus = () => import('@/views/dwd_refresh_status/index.vue')
 const DwsLayer = () => import('@/views/dws_layer/index.vue')
 const DimModel = () => import('@/views/dim_model/index.vue')
 const SnapshotMgr = () => import('@/views/snapshot_mgr/index.vue')
@@ -30,6 +31,7 @@ const router = createRouter({
     { path: '/dedup_config', name: 'dedup_config', component: DedupConfig },
     { path: '/ods_layer', name: 'ods_layer', component: OdsLayer },
     { path: '/dwd_layer', name: 'dwd_layer', component: DwdLayer },
+    { path: '/dwd_refresh_status', name: 'dwd_refresh_status', component: DwdRefreshStatus },
     { path: '/dws_layer', name: 'dws_layer', component: DwsLayer },
     { path: '/dim_model', name: 'dim_model', component: DimModel },
     { path: '/snapshot_mgr', name: 'snapshot_mgr', component: SnapshotMgr },

@@ -23,6 +23,10 @@ def reset_store():
     store._snapshot_data.clear()
     store._archive_records.clear()
     store._backfill_partitions.clear()
+    store._refresh_events.clear()
+    store._refresh_status.clear()
+    store._refresh_status_history.clear()
+    store._refresh_seed_done = False
 
 
 class TestSnapshotArchive:

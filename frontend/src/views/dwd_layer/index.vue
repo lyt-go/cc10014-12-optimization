@@ -6,6 +6,7 @@
         <p class="page-desc">维护明细层DWD表的输入、执行约束与结果记录，为明细层管理提供可验证的数据工程流程。</p>
       </div>
       <div class="page-actions">
+        <button class="btn" data-testid="goto-refresh-status" type="button" @click="gotoRefreshStatus">明细刷新状态视图</button>
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">登记明细表</button>
         <button class="btn" data-testid="export" type="button" @click="exportRows">导出明细层管理清单</button>
       </div>
@@ -48,6 +49,14 @@
             >
               {{ action }}
             </button>
+            <button
+              class="link"
+              type="button"
+              :data-testid="`build-${row.id}`"
+              @click="buildDwd(row)"
+            >
+              刷新构建
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -81,11 +90,13 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 
 import { request } from '@/api/client'
 
 type Row = Record<string, string | number | null>
 
+const router = useRouter()
 const ENDPOINT = '/api/dwd_layer'
 const columns = ["表编号", "父层来源", "表名称", "粒度说明", "分区字段", "关联键列", "刷新水位", "创建批次"]
 const actions = ["提交校验", "确认上线", "标记下线"]
@@ -165,6 +176,24 @@ async function runAction(action: string, row: Row) {
     await reload()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '明细层管理操作失败'
+  }
+}
+
+function gotoRefreshStatus() {
+  void router.push('/dwd_refresh_status')
+}
+
+async function buildDwd(row: Row) {
+  errorMessage.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/${row.id}/build`, { method: 'POST' })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.message || '明细刷新构建失败')
+    }
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '明细刷新构建失败'
   }
 }
 

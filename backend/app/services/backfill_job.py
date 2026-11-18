@@ -1,10 +1,16 @@
 """补数调度 时间线服务：作用于具体表，修改分区水位，记录补数区间。"""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from app.store import store
+from app.services.dwd_refresh_status import (
+    EVENT_BACKFILL,
+    STATUS_FAILED,
+    STATUS_SUCCESS,
+    DwdRefreshStatusService,
+)
 
 MODULE = "backfill_job"
 REQUIRED_FIELDS = ["任务编号", "目标表名", "起始日期"]
@@ -98,3 +104,59 @@ class BackfillJobService:
         for row in store.rows("ods_layer"):
             if row.get("表名称") == table:
                 store.save_version("ods_layer", row["id"], row)
+        # 补数事件沿调用链同步到明细刷新状态视图（仅DWD明细表），
+        # 与定时刷新事件冲突时按优先次序裁决，较宽边界展示修复批次与重试链。
+        dwd_tables = {row.get("表名称") for row in store.rows("dwd_layer")}
+        if table in dwd_tables and new_partitions:
+            self._emit_refresh_events(entry, new_partitions)
+
+    def _emit_refresh_events(self, entry: dict[str, Any], partitions: list[dict[str, Any]]) -> None:
+        job_code = entry.get("任务编号", "")
+        table = entry.get("目标表名", "")
+        failed_set = self._parse_failure_intervals(entry.get("失败区间", ""))
+        batch_id = f"BF-{job_code}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        events = []
+        for seq, partition in enumerate(sorted({p.get("dt", "") for p in partitions if p.get("dt")}), start=1):
+            failed = partition in failed_set
+            events.append({
+                "批次编号": batch_id,
+                "事件类型": EVENT_BACKFILL,
+                "表名称": table,
+                "分区值": partition,
+                "刷新水位": partition,
+                "状态": STATUS_FAILED if failed else STATUS_SUCCESS,
+                "完成时间": "" if failed else now_iso,
+                "修复批次": "" if failed else batch_id,
+                "失败原因": "补数区间仍失败，等待下一轮重试" if failed else "",
+                "事件序号": seq,
+            })
+        try:
+            DwdRefreshStatusService().record_events(events, batch_id=batch_id)
+        except ValueError:
+            # 状态视图落库失败不推翻已完成的补数写入，下一轮补数或定时刷新会重新同步
+            entry["_refresh_sync_error"] = True
+
+    def _parse_failure_intervals(self, raw: str) -> set[str]:
+        """失败区间支持逗号分隔的单日（2026-10-05）与闭区间（2026-10-05~2026-10-07）。"""
+        result: set[str] = set()
+        for token in str(raw or "").replace("，", ",").replace("～", "~").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "~" in token:
+                left, right = (part.strip() for part in token.split("~", 1))
+                try:
+                    d = date.fromisoformat(left)
+                    end = date.fromisoformat(right)
+                    while d <= end:
+                        result.add(d.isoformat())
+                        d += timedelta(days=1)
+                except ValueError:
+                    continue
+            else:
+                try:
+                    result.add(date.fromisoformat(token).isoformat())
+                except ValueError:
+                    continue
+        return result
